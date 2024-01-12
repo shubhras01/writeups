@@ -1,0 +1,120 @@
+---
+title: Building Financial Search System
+date: '2023-08-12'
+tags: ['Search System Design']
+draft: false
+summary: Building financial search system for Neobank from scratch
+---
+
+Note: This design was before LLM.
+
+This is a detailed post about how I designed and built a financial search system for an Indian Neobank.
+
+**Problem Statement**: Given user transactions, the system should be able to give results for user queries like,
+```python
+User query example:  
+1.how much i spent on netflix last year  
+2.my spends this week  
+3.biggest spend in last 6 month  
+4.transactions with <user_name> / <business_name>  
+5.how to raise support ticket
+```
+
+Rest of the blog is divided in sections:
+
+-   System Design
+-   Query rewriting and feature extraction
+-   Feedback and relevance calculation
+
+## System Design
+
+We can easily classify queries in multiple domains. The query result can come from user’s transactions, Faq’s, and also from many features available on neobanking app.
+
+Here is the design for financial search system:
+
+<figure>
+    <figcaption>Design for Financial search system </figcaption>
+    <img src="https://miro.medium.com/v2/resize:fit:700/1*ZJvFc3Pk8ijM4RbUBMz0Qg.png" />
+</figure>
+
+
+**gRPC search service:** we built a golang gRPC service which handled user queries.
+
+1.  The service sent request to huggingface models service and collected results of features extracted in NLU or similar query.
+2.  Based on the output from the model layer, it builds an es query and sends es query to the already built connection with es_client. Es service executed the results and sent them back to the search service.
+3.  Search service then collects results from es, and formats the results with other user related information, and sends back to the user.
+
+## **Query Rewriting and Feature Extraction:**
+
+We indexed structured data into es, whereas the user query was a natural language query. To transform user’s query to es query language, we used 2 systems
+
+1.  **_Similar Query Detection_**_:_  We used huggingface pre-trained  [sentence transformer model]("https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2")  to get embeddings from our previously known corpus. This corpus has 1:1 mapping with prestructured es queries, which can directly be handled by es and results generated.
+
+<figure>
+    <figcaption>Similar query detection</figcaption>
+    <img src="https://miro.medium.com/v2/resize:fit:651/1*GQwiv3NF6cQ7fKwQ_HEzig.png" />
+</figure>
+
+For a user query input,  **cosine similarity was computed against all previously known queries, and if top_score > threshold, we executed a mapped es query**, and showed results.
+
+The system worked really well for queries that belong to faqs, feature related queries, general queries like “netflix spends”, “how to open a deposit” etc.
+```json
+User query: "start auto-sip"  
+  
+query_corpus: {  
+              "how to save",  
+              "how to start sip",   
+              "what is sip",   
+              "how to open account",  
+            }  
+highest cosine similarity : "how to start sip"
+```
+
+2. **_Intent + feature extraction_**: If similar query detection did not output a similarity score > threshold, another module handled the query. This module was built on huggingface built-in classification model and ner model. The ner model detected entities like \<time\>, \<place\>, \<amount\> and classification model classified queries into classes like invest, spends, credits, debits, faqs etc.
+
+Example of how a user-query is transformed to elasticsearch query with NLU module:
+```json
+query : "how much i invested in fd last year"  
+  
+NLU output:  
+{"intent": "savings",  
+"entity": {  
+          "instrument": "fd",  
+          "time": "last year"  
+          }  
+}  
+  
+ES query:   
+{  
+"user_id": <user_id>,  
+"instrument": "FD",  
+"transaction_type": "CREDIT",  
+"from_time": <today - 1 year>,  
+"to_time": <today>  
+}
+```
+
+## Feedback and relevance calculation:
+
+The relevance calculation in this system is tricky, as it tends to show only one result. The relevance here is calculated based on question-answer based system, how correct is answer (result shown to user) is wrt. question (user’s query).
+
+We developed an algorithm to calculate relevance of results. Objective of the algorithm is to calculate # of similar queries in an active session. And relevance was higher for a query if # of similar queries was lower.
+```python
+for single_session ε sessions(user_id):  
+        single_session_queries = get_queries(user_id, session_id)  
+        scores_set = get_similarity_score(single_session_queries)  
+        for score in scores_set:  
+              if score > threshold:  
+                  single_session_similar_query += 1  
+  
+output: {  
+        single_session_similar_query,  
+        single_session_similar_query_set  
+}
+```
+
+## **Next Steps**:
+
+The system worked very well for previously known queries. However, we need to build tools to identify which user queries are failing.
+
+For each new feature, we need to put developmnet effort in order to support showing results for that feature. Building a AST for how to support a feature, will help scaling the system very fast.

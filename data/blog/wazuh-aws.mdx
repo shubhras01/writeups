@@ -1,0 +1,81 @@
+---
+title: Ingest AWS guard-duty events in wazuh, without kinesis-firehose hop
+date: '2022-12-19'
+tags: ['security']
+draft: false
+summary: Save aws cost- ingesting AWS GuardDuty events in wazuh dashboard
+---
+
+
+**What is Wazuh:**  Wazuh is open source security platform. It provides endpoint-security, security intelligence, cloud security etc. Wazuh relies on  [ossec model](https://github.com/ossec)  for generating an alert.
+
+We can integrate multiple cloud security services, and index data to wazuh indexer, which can then provide a comprehensive view for the overall system-security.
+
+**What is GuardDuty:** [AWS GuardDuty](https://aws.amazon.com/guardduty/)  is a service by aws, which continuously montiors aws accounts and activities to montior and detect malicious activity.
+
+**How to ingest GuardDuty findings to Wazuh :** Wazuh provides a very detailed  [document](https://documentation.wazuh.com/current/amazon/services/supported-services/guardduty.html)  for integrating aws services to wazuh-dashboard. Essentially guardduty stores all the finidngs in s3 bucket. A kinesis-firehose stream will be subscribed to the s3 bucket and stores data in another s3 bucket.
+
+Wazuh suggested flow looks like below
+
+> _Guardduty → kinesis → firehose → s3 bucket_
+
+However, wazuh aws-s3 plugin ([opensource code](https://github.com/wazuh/wazuh/blob/master/wodles/aws/aws_s3.py)) is reading a s3 bucket and parses data in kinesis events format. We can read data from guardduty events, transform it in wazuh-expected format and put it to another bucket. This final bucket will be read by wazuh aws-s3 plugin and then indexed by wazuh-indexer.
+
+Updated flow looks like below
+
+> _Guardduty findings → s3 bucket_guardduty → cron job to transform events to kinesis events format → s3 bucket_wazuh_in_
+
+<figure text-align="center">
+  <figcaption text-align="center">flow to upload guard-duty events without kinesis and firehose</figcaption>
+  <img src="https://miro.medium.com/v2/resize:fit:700/0*-FZXanzhWx16DE6z.png" alt="wazuh hop"/>
+</figure>
+
+
+Here are the steps for setup:
+
+1.  Setup guardduty to send all findings / events to a s3 bucket, lets call it **guardduty-findings-s3-bucket**
+2.  Setup a cron job which will turn these events to kinesis data format, a simple function which will add fields required by wazuh aws-s3 wodle, is given below.
+```python
+def get_kinesis_format(guard_duty_events):  
+  tmp = ""  
+  for event_data in guard_duty_events:  
+    tmp += json.dumps({"detail": event_data, "source": "guardduty"})  
+  return tmp
+  ```
+
+3. Keep track of how many files you have visited in your cron script, by adding a marker-file in s3, lets call it  **wazuh-marker** bucket. Next cron job will first read marker-file and picks up s3 objects after the marker
+Simple way to query s3 bucket will include parameters like
+``
+"filter_args" = {  
+            'Bucket': <bucket>,  
+            'MaxKeys': <num_keys_to_fetch_in_single_pass>,  
+            'Prefix': <prefix>  
+            'StartAfter': <filter_marker>  
+        }
+        ``
+
+
+4. This cron-job will read data from guardduty s3 bucket and transforms data in kinesis event format. It will put it in the bucket which will be read by wazuh-manager. Lets call this output bucket as  **wazuh-transformed.**
+
+5. Now setup the wazuh configuration. Basic settings parameters looks like this in official documents
+```json
+<wodle name="aws-s3">  
+  <disabled>no</disabled>  
+  <interval>10m</interval>  
+  <run_on_start>yes</run_on_start>  
+  <skip_on_error>yes</skip_on_error>  
+  <bucket type="guardduty">  
+    <name>wazuh-aws-wodle</name>  
+    <path>wazuh-transformed/</path>  
+    <aws_profile>default</aws_profile>  
+  </bucket>  
+</wodle>
+```
+
+By default wazuh plugin will read s3 bucket every 10 minutes, but we can change this setting to process more real time events.
+
+6. wazuh-wodle aws-s3 will read the bucket and indexe the data in the opensearch, where it is further consumed by default dashboards.
+
+The whole setup relies on the fact that wazuh aws-s3 plugin reads data in kinesis event format. This will work like a charm, without having to setup kinesis-firehose stream.
+
+Wazuh community is working towards launching a support for reading data directly from guardduty. Will be released in further versions. Till then we can transform the data and see it on wazuh dashboard.
