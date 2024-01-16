@@ -5,7 +5,7 @@ interface Project {
   imgSrc?: string,
 }
 
-// const projectsData: Project[] = [
+ const projectsData: Project[] = [
 //   {
 //     title: 'A Search Engine',
 //     description: `What if you could look up any information in the world? Webpages, images, videos
@@ -22,6 +22,6 @@ interface Project {
 //     imgSrc: '/static/images/time-machine.jpg',
 //     href: '/blog/the-time-machine',
 //   },
-// ]
+]
 
 export default projectsData
