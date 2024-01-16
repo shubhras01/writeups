@@ -1,0 +1,202 @@
+---
+title: "Cracking the Code: A Deep Dive into the NSA Codebreak CTF - Task 4 and Beyond"
+date: '2024-01-16'
+tags: ['Security', 'CTF']
+draft: false
+summary: NSA Cbc task 4 writeup (Emulate the Firmware - (Dynamic Reverse Engineering, Cryptography))
+---
+
+## Introduction
+
+The NSA Codebreak CTF challenge is a thrilling venture into cybersecurity and encryption. This article details Task 4, a pivotal part of the challenge, and briefly recaps the previous tasks.
+
+## Task Summaries
+
+### Task 1: Signal Analysis for the US Coast Guard
+
+Analyzing an unregistered signal to find matches in the NSA database based on geographical coordinates and timestamps. 
+Given a .db file, you are supposed to write a sql query which will find the anomalies and give the answer.
+
+### Task 2: Embedded Device Interaction
+
+Identifying the correct processor datasheet and physical pins for data transfer on an embedded device.
+
+### Task 3: Kernel Decryption
+
+Decrypting the device's kernel using a second-stage bootloader and a QEMU docker container.
+You enter a `u-boot shell` and try to get the key value from the environment. Truns out its a s-box value, you would then read it with correct endianness and report the answer.
+
+## Task 4: Decrypting the Encrypted Filesystem
+
+### Problem Statement
+
+Decrypting and mounting an encrypted filesystem from a USB device, using the device firmware and LUKS encryption.
+
+Let's start with building the docker image, and run the qemu command as provided in the challenge 
+
+```bash
+export UBOOT=/myfiles/u-boot.bin
+export DTB=/myfiles/device_tree.dtb
+export KERNEL=/myfiles/kernel8.img
+export DTB=/myfiles/bcm2710-rpi-3-b-plus.dtb
+export SD_IMG=/myfiles/sd.img
+export USB_IMG=/myfiles/usb.img
+
+qemu-system-aarch64 -M raspi3b -m 1G -smp 4 -nographic -append "rw earlyprintk loglevel=8 console=ttyAMA0,115200 dwc_otg.lpm_enable=0 root=/dev/mmcblk0p2 rootdelay=1" -kernel $KERNEL -dtb $DTB -drive if=sd,index=0,format=raw,file=$SD_IMG -drive if=none,id=stick,format=raw,file=$USB_IMG -device usb-storage,drive=stick -netdev type=tap,id=usb0,script=/qemu-ifup,downscript=/qemu-ifdown -device usb-net,netdev=usb0 -netdev type=tap,id=usb1,script=no,downscript=no -device usb-net,netdev=usb1
+```
+
+<figure>
+    <figcaption>qemu startup logs</figcaption>
+    <img src="/static/images/nsa/qemu-start.png" />
+</figure>
+
+This spins up the emulated rpi3+ device in the docker container. In the startup logs, you can see its starting from /etc/init.d directory. Contents of that file is 
+
+```bash
+#!/bin/sh
+
+mount -t proc none /proc
+mount -t sysfs none /sys
+/sbin/mdev -s
+mount -a
+
+for drv in /drivers/*.ko; do
+  insmod $drv
+done
+
+[ -s /etc/hostname ] && hostname `cat /etc/hostname`
+
+PRIV_IP=10.101.255.254
+
+ifconfig lo 127.0.0.1 netmask 255.0.0.0
+ifconfig lo up
+ifconfig usb0 $PRIV_IP netmask 255.255.0.0
+ifconfig usb0 up
+
+ifconfig usb1 up
+udhcpc -i usb1 -s /etc/udhcpc.script -b &
+
+/sbin/dropbear -p $PRIV_IP:22
+
+/opt/mount_part /dev/sda2 /private /opt/part.enc /agent
+#(/agent/start >/dev/null 2>&1) &
+```
+
+Its running a script /opt/mount_part to mount the /opt/part.enc to /agent directory. But failing as /opt/mount_part script requires correct password.
+Contents of /opt/mount_part script 
+
+```bash
+#!/bin/sh
+
+SEC_DRIVE=$1
+SEC_MOUNT=$2
+ENC_PARTITION=$3
+ENC_MOUNT=$4
+
+[ ! -e $ENC_PARTITION ] && { echo "encrypted partition not found"; exit 1; }
+
+mkdir -p $SEC_MOUNT
+mount $SEC_DRIVE $SEC_MOUNT
+NAME=`hostname`
+ID=`cat /private/id.txt`
+
+DATA="${NAME}${ID:0:3}"
+echo "cryptsetup: opening $ENC_PARTITION"
+echo -n $DATA | openssl sha1 | awk '{print $NF}' | cryptsetup open $ENC_PARTITION part
+mkdir -p $ENC_MOUNT
+mount /dev/mapper/part $ENC_MOUNT
+```
+
+Its reading /private/id.txt file for part of password and with help of that generating the encryption password. Obvioulsy /private/id.txt file has nothing, and now we know what is the task 4 all about. 
+
+Looking closely at the script, you can check only 3 characters are required from `/private/id.txt` file. Looks easy enough. To bruteforce first 3 chars for the password. 
+
+The actual know-how starts here. 
+#### 1. figure out the encryption setup for the encrypted file system 
+    Most file systems are encrypted with luks for rpi3+ devices. We need to confirm if the given encrypted blob is one from luks 
+```bash
+cryptsetup luksDump /dev/sdb3
+``` 
+it will output the encryption-type used and slots used for the encryption. A very good LUKS understanding document is [here(https://diverto.github.io/2019/11/18/Cracking-LUKS-passphrases)] 
+
+#### 2. Start passwords for bruteforcing - after all its only 3 chars 
+```bash
+hashcat --stdout -a 3 drypush?a?a?a > passwords.txt
+```
+remember that the passphrase to find is not directly "drypush???".
+It's derived from that by applying SHA-1 and then used as a passphrase for LUKS.
+We need an intermediary step to compute the SHA-1 of each generated password and then use those SHA-1 outputs to try and decrypt the LUKS header. Once after generating the passwords, we can use hashcat to decrypt with this command 
+
+To crack a LUKS header, the LUKS passphrase is derived from a SHA-1 hash of some input.
+The script /opt/mount_part takes the hostname, concatenates it with the first 3 characters of some ID, then takes the SHA-1 hash of that string, and uses the hash as the passphrase to decrypt a LUKS partition.
+Let's try to replicate this process with Hashcat:
+
+1. Generate potential candidates (the combination of hostname and the first three characters of id.txt).
+```bash
+hashcat --stdout -a 3 drypush?a?a?a > raw_combinations.txt
+```
+2. Hash each of these candidates using SHA-1.
+```bash
+while read line; do echo -n "$line" | openssl dgst -sha1; done < raw_combinations.txt > hashed_combinations.txt
+```
+3. Use the resulting SHA-1 hashes as potential passphrases against the LUKS header
+```bash
+hashcat -m 14600 recieved.bin hashed_combinations.txt
+```
+
+#### 3. Running the above on my laptop (NVIDIA RTX A6000)
+```bash
+
+Minimum password length supported by kernel: 0
+Maximum password length supported by kernel: 256
+
+Hashes: 2 digests; 2 unique digests, 2 unique salts
+Bitmaps: 16 bits, 65536 entries, 0x0000ffff mask, 262144 bytes, 5/13 rotates
+Rules: 1
+
+Optimizers applied:
+* Zero-Byte
+* Slow-Hash-SIMD-LOOP
+
+Watchdog: Temperature abort trigger set to 90c
+
+Host memory required for this attack: 872 MB
+
+Dictionary cache hit:
+* Filename..: hashed_combinations.txt
+* Passwords.: 602395
+* Bytes.....: 24698195
+* Keyspace..: 602395
+
+..........................................
+..........................................
+..........................................
+
+Session..........: hashcat
+Status...........: Exhausted
+Hash.Mode........: 14600 (LUKS)
+Hash.Target......: hashcat.luks
+Time.Started.....: Mon Oct 30 22:44:55 2023 (53 mins, 43 secs)
+Time.Estimated...: Mon Oct 30 23:38:38 2023 (0 secs)
+Kernel.Feature...: Pure Kernel
+Guess.Base.......: File (hashed_combinations.txt)
+Guess.Queue......: 1/1 (100.00%)
+Speed.#1.........:      240 H/s (0.45ms) @ Accel:64 Loops:64 Thr:32 Vec:1
+Recovered........: 1/2 (50.00%) Digests, 1/2 (50.00%) Salts
+Progress.........: 1204790/1204790 (100.00%)
+Rejected.........: 0/1204790 (0.00%)
+Restore.Point....: 602395/602395 (100.00%)
+Restore.Sub.#1...: Salt:1 Amplifier:0-1 Iteration:4017472-4017531
+Candidate.Engine.: Host Generator + PCIe
+Candidates.#1....: 423ab493061d283c4ebd88348056e2c285acc7ab -> 301ac322b2c7daf6f8183a55d8c26b1515c58037
+Hardware.Mon.#1..: Temp: 70c Fan: 44% Util: 89% Core:1875MHz Mem:7600MHz Bus:16
+```
+
+`Recovered........: 1/2 (50.00%) Digests, 1/2 (50.00%) Salts` --> tells we have recovered 1st slot from LUKS header. Thats all we wanted, as the 1st slot passphrase was required to decrypt the 2nd slot.
+
+Problem solved. 
+
+<figure>
+    <figcaption>task 4 badge</figcaption>
+    <img src="/static/images/nsa/badge4.png" />
+</figure>
